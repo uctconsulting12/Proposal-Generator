@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Environment
+.env
+
+# Runtime data / generated state
+web_sessions.json
+qdrant_data/
+jd_intake_records.json
+
+
+
+
+# Retired / unused files
+trash/
+
+# Knowledge-base documents (keep the directory + README, ignore content)
+knowledge_base/*
+!knowledge_base/README.txt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+node_modules/
+
+
+#claude
+.claude
+
+#Profile
+profiles/*
