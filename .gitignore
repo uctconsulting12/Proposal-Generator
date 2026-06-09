@@ -9,6 +9,15 @@ venv/
 # Environment
 .env
 
+# Secrets / local credential files (never commit these)
+*pass*.txt
+*password*.txt
+*secret*.txt
+*credentials*.txt
+test.py
+*.pem
+*.key
+
 # Runtime data / generated state
 web_sessions.json
 qdrant_data/
@@ -19,10 +28,17 @@ jd_intake_records.json
 
 # Retired / unused files
 trash/
+# Legacy vanilla-JS frontend, replaced by frontend-react/
+frontend/
 
-# Knowledge-base documents (keep the directory + README, ignore content)
-knowledge_base/*
-!knowledge_base/README.txt
+# Knowledge base is cloud-backed (MongoDB) now; nothing local is needed.
+knowledge_base/
+
+# Docs / demo assets not needed by the running app.
+# (Demo Image/ is intentionally kept — it is used by README.md.)
+claude mkb.png
+Screenshot*.png
+*.bak
 
 # OS / editor
 .DS_Store

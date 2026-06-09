@@ -4,22 +4,23 @@ A profile holds the bits used to brand a freelancer's proposals: company
 name, a short "about us" introduction (also used as LLM context so the
 assistant writes in the user's voice), an optional signature, an accent
 colour for the PDF, and an optional logo image. Text fields live in
-MongoDB next to the user; the logo is stored on disk under
-``profiles/<user_id>/logo.<ext>`` so MongoDB stays small and the file can
-be streamed directly.
+MongoDB next to the user; the logo image bytes live in GridFS (bucket
+``logos``, one file per user) so the logo, like everything else, follows
+the user across devices instead of sitting on one machine's disk.
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from bson import ObjectId
-from pymongo import MongoClient
 
 from .config import Settings
+from .db import get_db, get_gridfs
+
+_LOGO_BUCKET = "logos"
 
 _ALLOWED_LOGO_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -42,19 +43,11 @@ EMPTY_PROFILE = {
 
 
 def _users(settings: Settings):
-    client = MongoClient(settings.mongodb_uri)
-    db = client[settings.mongodb_db_name]
-    return db["users"]
+    return get_db(settings)["users"]
 
 
 def _user_id_to_object(user_id: str) -> ObjectId:
     return ObjectId(user_id)
-
-
-def _user_logo_dir(settings: Settings, user_id: str) -> Path:
-    directory = settings.profiles_dir / user_id
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
 
 
 def get_profile(settings: Settings, user_id: str) -> dict[str, Any]:
@@ -64,10 +57,10 @@ def get_profile(settings: Settings, user_id: str) -> dict[str, Any]:
     )
     profile = (doc or {}).get("profile") or {}
     merged = {**EMPTY_PROFILE, **profile}
-    # Reflect on-disk truth for the logo, in case it was deleted out-of-band.
-    merged["has_logo"] = bool(merged.get("logo_mime")) and _find_logo_file(
+    # Reflect the cloud truth for the logo, in case it was removed out-of-band.
+    merged["has_logo"] = bool(merged.get("logo_mime")) and _logo_exists(
         settings, user_id
-    ) is not None
+    )
     return merged
 
 
@@ -117,27 +110,27 @@ def update_profile(
 def save_logo(
     settings: Settings, user_id: str, *, payload: bytes, suffix: str, mime: str
 ) -> dict[str, Any]:
-    """Persist a new logo on disk and update profile metadata in MongoDB."""
+    """Persist a new logo to GridFS and update profile metadata in MongoDB."""
     suffix = suffix.lower()
     if suffix not in _ALLOWED_LOGO_SUFFIXES:
         allowed = ", ".join(sorted(_ALLOWED_LOGO_SUFFIXES))
         raise ValueError(f"Unsupported image type '{suffix}'. Allowed: {allowed}")
 
-    directory = _user_logo_dir(settings, user_id)
-    # Wipe any previous logo (extension may differ) so listing stays clean.
-    for existing in directory.glob("logo.*"):
+    fs = get_gridfs(settings, _LOGO_BUCKET)
+    # Wipe any previous logo so only the latest one is stored per user.
+    for old in fs.find({"user_id": user_id}):
         try:
-            existing.unlink()
-        except OSError:
+            fs.delete(old._id)
+        except Exception:  # noqa: BLE001
             pass
-    target = directory / f"logo{suffix}"
-    target.write_bytes(payload)
+    fs.put(payload, user_id=user_id, suffix=suffix, contentType=mime)
 
     _users(settings).update_one(
         {"_id": _user_id_to_object(user_id)},
         {
             "$set": {
                 "profile.logo_mime": mime,
+                "profile.logo_suffix": suffix,
                 "profile.logo_updated_at": _now_iso(),
                 "profile.updated_at": _now_iso(),
             }
@@ -147,19 +140,19 @@ def save_logo(
 
 
 def delete_logo(settings: Settings, user_id: str) -> dict[str, Any]:
-    """Remove the logo file and clear its metadata."""
-    directory = settings.profiles_dir / user_id
-    if directory.exists():
-        for existing in directory.glob("logo.*"):
-            try:
-                existing.unlink()
-            except OSError:
-                pass
+    """Remove the logo from GridFS and clear its metadata."""
+    fs = get_gridfs(settings, _LOGO_BUCKET)
+    for old in fs.find({"user_id": user_id}):
+        try:
+            fs.delete(old._id)
+        except Exception:  # noqa: BLE001
+            pass
     _users(settings).update_one(
         {"_id": _user_id_to_object(user_id)},
         {
             "$set": {
                 "profile.logo_mime": "",
+                "profile.logo_suffix": "",
                 "profile.logo_updated_at": "",
                 "profile.updated_at": _now_iso(),
             }
@@ -170,24 +163,29 @@ def delete_logo(settings: Settings, user_id: str) -> dict[str, Any]:
 
 def load_logo_bytes(
     settings: Settings, user_id: str
-) -> tuple[bytes, str, Path] | None:
-    """Return (bytes, mime, path) of the user's logo, or None if absent."""
-    path = _find_logo_file(settings, user_id)
-    if path is None:
+) -> tuple[bytes, str, str] | None:
+    """Return (bytes, mime, suffix) of the user's logo, or None if absent."""
+    grid_out = _latest_logo(settings, user_id)
+    if grid_out is None:
         return None
-    profile = get_profile(settings, user_id)
-    mime = profile.get("logo_mime") or _mime_for(path.suffix)
-    return path.read_bytes(), mime, path
+    suffix = str(getattr(grid_out, "suffix", "") or "")
+    mime = str(getattr(grid_out, "contentType", "") or "") or _mime_for(suffix)
+    return grid_out.read(), mime, suffix
 
 
-def _find_logo_file(settings: Settings, user_id: str) -> Path | None:
-    directory = settings.profiles_dir / user_id
-    if not directory.exists():
-        return None
-    for candidate in directory.glob("logo.*"):
-        if candidate.is_file() and candidate.suffix.lower() in _ALLOWED_LOGO_SUFFIXES:
-            return candidate
-    return None
+def _latest_logo(settings: Settings, user_id: str):
+    """Return the most recent GridFS logo object for a user, or None."""
+    fs = get_gridfs(settings, _LOGO_BUCKET)
+    candidates = sorted(
+        fs.find({"user_id": user_id}),
+        key=lambda f: getattr(f, "upload_date", None) or 0,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _logo_exists(settings: Settings, user_id: str) -> bool:
+    return get_gridfs(settings, _LOGO_BUCKET).exists({"user_id": user_id})
 
 
 def _mime_for(suffix: str) -> str:

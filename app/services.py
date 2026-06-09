@@ -14,13 +14,13 @@ from fastapi import Request
 from .config import Settings
 from .llm import LlmClient
 from .rag import RagService
-from .storage import SessionStore
+from .storage import MongoSessionStore
 
 
 @dataclass
 class Services:
     settings: Settings
-    store: SessionStore
+    store: MongoSessionStore
     llm: LlmClient
     rag: RagService
 
@@ -33,7 +33,7 @@ def get_settings_dep(request: Request) -> Settings:
     return _services(request).settings
 
 
-def get_store(request: Request) -> SessionStore:
+def get_store(request: Request) -> MongoSessionStore:
     return _services(request).store
 
 

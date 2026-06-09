@@ -226,3 +226,172 @@ class SessionStore:
             session["closed"] = False
             session["updated_at"] = _utc_now()
             self._persist()
+
+
+class MongoSessionStore:
+    """Session store backed by a MongoDB collection.
+
+    Drop-in replacement for :class:`SessionStore` exposing the same methods,
+    but every session lives in MongoDB instead of a local JSON file. That is
+    what makes chat history follow a user across devices: sign in with the
+    same account from anywhere and the same sessions are there.
+
+    The session UUID is used directly as the document ``_id``. Each document
+    additionally carries ``user_id`` so listing/loading can be scoped to the
+    authenticated user (the multi-tenant isolation boundary).
+    """
+
+    def __init__(self, settings, *, max_sessions: int, max_messages: int) -> None:
+        from .db import get_db
+
+        self._settings = settings
+        self._max_sessions = max_sessions
+        self._max_messages = max_messages
+        self._col = get_db(settings)["sessions"]
+        try:
+            self._col.create_index("user_id")
+            self._col.create_index("updated_at")
+        except Exception as exc:  # noqa: BLE001 - don't crash boot on a DB hiccup
+            logger.warning("Could not ensure session indexes at startup: %s", exc)
+
+    # -- lifecycle --------------------------------------------------------
+    def load(self) -> None:
+        """No-op: MongoDB is the live store, nothing to load into memory."""
+        logger.info("Session store backed by MongoDB collection 'sessions'")
+
+    # -- queries ----------------------------------------------------------
+    def count(self) -> int:
+        return self._col.count_documents({})
+
+    def get(self, session_id: str) -> dict[str, Any] | None:
+        doc = self._col.find_one({"_id": session_id})
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    # -- mutations --------------------------------------------------------
+    def create(
+        self,
+        *,
+        user_id: str,
+        intake: dict[str, Any],
+        messages: list[dict[str, str]],
+        retrieved_chunks: list[dict[str, str]],
+        stage: str,
+    ) -> str:
+        """Create a new session, evicting the oldest if at capacity."""
+        session_id = str(uuid.uuid4())
+        now = _utc_now()
+        # Enforce the global LRU cap by trimming the oldest sessions.
+        excess = self._col.count_documents({}) - (self._max_sessions - 1)
+        if excess > 0:
+            oldest = self._col.find(
+                {}, {"_id": 1}
+            ).sort("updated_at", 1).limit(excess)
+            ids = [d["_id"] for d in oldest]
+            if ids:
+                self._col.delete_many({"_id": {"$in": ids}})
+                logger.info("Evicted %d oldest session(s) (capacity reached)", len(ids))
+        self._col.insert_one(
+            {
+                "_id": session_id,
+                "user_id": user_id,
+                "intake": intake,
+                "messages": messages[-self._max_messages :],
+                "retrieved_chunks": retrieved_chunks,
+                "stage": stage,
+                "questions_asked": 0,
+                "closed": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return session_id
+
+    def append_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        *,
+        stage: str | None = None,
+        questions_asked: int | None = None,
+    ) -> None:
+        """Append a user/assistant exchange and optionally update stage state."""
+        doc = self._col.find_one({"_id": session_id}, {"messages": 1})
+        if doc is None:
+            raise KeyError(session_id)
+        messages = list(doc.get("messages", []))
+        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "assistant", "content": assistant_message})
+        # Keep the system prompt (index 0) and cap the rolling history.
+        if len(messages) > self._max_messages:
+            system = messages[:1]
+            messages = system + messages[-(self._max_messages - 1) :]
+        update: dict[str, Any] = {"messages": messages, "updated_at": _utc_now()}
+        if stage is not None:
+            update["stage"] = stage
+        if questions_asked is not None:
+            update["questions_asked"] = questions_asked
+        self._col.update_one({"_id": session_id}, {"$set": update})
+
+    def messages_for(self, session_id: str) -> list[dict[str, str]]:
+        """Return a copy of the message history for an LLM call."""
+        doc = self._col.find_one({"_id": session_id}, {"messages": 1})
+        if doc is None:
+            raise KeyError(session_id)
+        return list(doc.get("messages", []))
+
+    def list_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        """Return lightweight session metadata for a user, newest first."""
+        cursor = self._col.find(
+            {"user_id": user_id},
+            {"intake": 1, "stage": 1, "closed": 1, "created_at": 1, "updated_at": 1},
+        )
+        rows: list[dict[str, Any]] = []
+        for session in cursor:
+            intake = session.get("intake", {})
+            rows.append(
+                {
+                    "session_id": str(session["_id"]),
+                    "job_title": str(intake.get("job_title", "")).strip() or "Untitled JD",
+                    "stage": str(session.get("stage", "")),
+                    "closed": bool(session.get("closed", False)),
+                    "created_at": str(session.get("created_at", "")),
+                    "updated_at": str(session.get("updated_at", "")),
+                }
+            )
+        rows.sort(key=lambda r: r["updated_at"], reverse=True)
+        return rows
+
+    def finalize(self, session_id: str) -> None:
+        """Mark a session as finalized (closed to any further messages)."""
+        res = self._col.update_one(
+            {"_id": session_id},
+            {"$set": {"closed": True, "updated_at": _utc_now()}},
+        )
+        if res.matched_count == 0:
+            raise KeyError(session_id)
+
+    def set_field(self, session_id: str, key: str, value: Any) -> None:
+        """Persist an arbitrary session-level field (e.g. the cached PDF title)."""
+        res = self._col.update_one(
+            {"_id": session_id},
+            {"$set": {key: value, "updated_at": _utc_now()}},
+        )
+        if res.matched_count == 0:
+            raise KeyError(session_id)
+
+    def delete(self, session_id: str) -> None:
+        """Remove a session entirely. Idempotent — unknown id is a no-op."""
+        self._col.delete_one({"_id": session_id})
+
+    def reopen(self, session_id: str) -> None:
+        """Reopen a finalized session so messaging is allowed again."""
+        res = self._col.update_one(
+            {"_id": session_id},
+            {"$set": {"closed": False, "updated_at": _utc_now()}},
+        )
+        if res.matched_count == 0:
+            raise KeyError(session_id)

@@ -11,18 +11,16 @@ from typing import Any
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pymongo import MongoClient
 
 from .config import Settings
+from .db import get_db
 from .services import get_settings_dep
 
 _bearer = HTTPBearer(auto_error=False)
 
 
 def _users_collection(settings: Settings):
-    client = MongoClient(settings.mongodb_uri)
-    db = client[settings.mongodb_db_name]
-    col = db["users"]
+    col = get_db(settings)["users"]
     col.create_index("email", unique=True)
     return col
 

@@ -52,7 +52,7 @@ from ..schemas import (
     StartSessionResponse,
 )
 from ..services import get_llm, get_rag, get_settings_dep, get_store
-from ..storage import SessionStore
+from ..storage import MongoSessionStore
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/session", tags=["sessions"])
@@ -296,7 +296,7 @@ def _squash_history_for_final(history: list[dict[str, str]]) -> list[dict[str, s
 @router.post("/start", response_model=StartSessionResponse)
 async def start_session(
     intake: JDIntake,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     llm: LlmClient = Depends(get_llm),
     rag: RagService = Depends(get_rag),
     settings: Settings = Depends(get_settings_dep),
@@ -353,7 +353,7 @@ async def start_session(
 async def post_message(
     payload: MessageRequest,
     session_id: str = _SESSION_ID,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     llm: LlmClient = Depends(get_llm),
     settings: Settings = Depends(get_settings_dep),
     user: dict[str, str] = Depends(require_user),
@@ -457,7 +457,7 @@ async def post_message(
 @router.post("/{session_id}/finalize", response_model=FinalizeResponse)
 async def finalize_session(
     session_id: str = _SESSION_ID,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     user: dict[str, str] = Depends(require_user),
 ) -> FinalizeResponse:
     """Finalize a session: lock it so no further messages can be sent."""
@@ -475,7 +475,7 @@ async def finalize_session(
 @router.delete("/{session_id}", response_model=FinalizeResponse)
 async def delete_session(
     session_id: str = _SESSION_ID,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     user: dict[str, str] = Depends(require_user),
 ) -> FinalizeResponse:
     """Discard a session entirely (the Save/Discard prompt's Discard path)."""
@@ -490,7 +490,7 @@ async def delete_session(
 @router.post("/{session_id}/reopen", response_model=FinalizeResponse)
 async def reopen_session(
     session_id: str = _SESSION_ID,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     user: dict[str, str] = Depends(require_user),
 ) -> FinalizeResponse:
     """Reopen a previously-finalized session so editing can resume.
@@ -558,7 +558,7 @@ def _to_display_messages(messages: list[dict[str, str]]) -> list[SessionMessage]
 
 @router.get("/list", response_model=SessionListResponse)
 async def list_sessions(
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     user: dict[str, str] = Depends(require_user),
 ) -> SessionListResponse:
     """List the authenticated user's previous sessions."""
@@ -568,7 +568,7 @@ async def list_sessions(
 @router.get("/{session_id}", response_model=SessionDetailResponse)
 async def get_session(
     session_id: str = _SESSION_ID,
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     user: dict[str, str] = Depends(require_user),
 ) -> SessionDetailResponse:
     """Load one session so the frontend can switch between histories."""
@@ -595,7 +595,7 @@ async def download_proposal_pdf(
         description="Override the user's default PDF template for this export only.",
         max_length=64,
     ),
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     settings: Settings = Depends(get_settings_dep),
     llm: LlmClient = Depends(get_llm),
     user: dict[str, str] = Depends(require_user),
@@ -645,7 +645,7 @@ async def download_proposal_pdf(
         profile_store.load_logo_bytes, settings, user["user_id"]
     )
     logo_bytes = logo_payload[0] if logo_payload else None
-    logo_suffix = logo_payload[2].suffix if logo_payload else ""
+    logo_suffix = logo_payload[2] if logo_payload else ""
 
     company_name = profile.get("company_name") or settings.pdf_brand_name
     # Per-request override wins; otherwise honour the user's saved default.

@@ -1,0 +1,32 @@
+# Keep the build context small and free of secrets / local state.
+.git
+.gitignore
+.env
+*.txt.bak
+MongoDB admin pass*.txt
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime data (rebuilt in the cloud from MongoDB / regenerated).
+qdrant_data/
+web_sessions.json
+knowledge_base/
+profiles/
+jd_intake_records.json
+
+# Frontend deps/build are produced inside the image's build stage.
+frontend-react/node_modules/
+frontend-react/dist/
+frontend/
+node_modules/
+
+# Docs / images / editor cruft not needed at runtime.
+Demo Image/
+*.png
+.idea/
+.vscode/
+.claude/
+tests/

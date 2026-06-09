@@ -9,14 +9,14 @@ from ..llm import LlmClient
 from ..rag import RagService
 from ..schemas import HealthResponse
 from ..services import get_llm, get_rag, get_store
-from ..storage import SessionStore
+from ..storage import MongoSessionStore
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health(
-    store: SessionStore = Depends(get_store),
+    store: MongoSessionStore = Depends(get_store),
     rag: RagService = Depends(get_rag),
     llm: LlmClient = Depends(get_llm),
 ) -> HealthResponse:

@@ -26,7 +26,7 @@ from .logging_config import configure_logging, request_id_var
 from .rag import RagService
 from .routers import auth, health, kb, profile, sessions, templates
 from .services import Services
-from .storage import SessionStore
+from .storage import MongoSessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build services on startup and release them on shutdown."""
     settings: Settings = app.state.settings
 
-    store = SessionStore(
-        settings.sessions_file,
+    store = MongoSessionStore(
+        settings,
         max_sessions=settings.max_sessions,
         max_messages=settings.max_messages_per_session,
     )

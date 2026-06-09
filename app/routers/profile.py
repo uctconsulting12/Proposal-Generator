@@ -128,7 +128,7 @@ def serve_logo(
     result = profile_store.load_logo_bytes(settings, user["user_id"])
     if result is None:
         raise NotFoundError("No logo uploaded.")
-    payload, mime, _path = result
+    payload, mime, _suffix = result
     return Response(
         content=payload,
         media_type=mime,

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import re
-from datetime import datetime, timezone
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -14,6 +13,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from ..auth import require_user
+from .. import kb_store
 from ..errors import AppError, DependencyUnavailableError, NotFoundError, UpstreamError
 from ..llm import LlmClient
 from ..rag import RagService, extract_text
@@ -38,16 +38,29 @@ def _safe_filename(name: str) -> str:
     return cleaned or "upload.txt"
 
 
-def _write_sidecar(target: Path, meta: dict) -> None:
-    """Persist KB document metadata next to the original file."""
-    meta_path = target.with_suffix(target.suffix + ".meta.json")
+def _extract_text_from_bytes(payload: bytes, suffix: str) -> str:
+    """Extract plain text from uploaded bytes.
+
+    ``extract_text`` works off a file path (it sniffs the suffix and uses the
+    right parser for PDF/DOCX), so we stage the bytes in a temporary file,
+    extract, then discard it. Nothing is persisted to local disk — the bytes
+    of record live in MongoDB/GridFS.
+    """
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
     try:
-        meta_path.write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        logger.warning("Could not write KB metadata sidecar %s: %s", meta_path, exc)
+        try:
+            return extract_text(tmp_path)
+        except Exception:  # noqa: BLE001
+            if suffix in {".txt", ".md", ".json"}:
+                return payload.decode("utf-8", errors="ignore")
+            return ""
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 _GITHUB_URL_RE = re.compile(
@@ -179,23 +192,25 @@ async def upload_document(
             status_code=400,
         )
 
-    user_dir = settings.kb_dir / "client_uploads" / user["user_id"]
-    user_dir.mkdir(parents=True, exist_ok=True)
-    target = user_dir / safe_name
     payload = await file.read()
-    target.write_bytes(payload)
     await file.close()
 
-    try:
-        text = await run_in_threadpool(extract_text, target)
-    except Exception:  # noqa: BLE001
-        # Fallback extraction for plain text-ish files.
-        if suffix in {".txt", ".md", ".json"}:
-            text = target.read_text(encoding="utf-8", errors="ignore")
-        else:
-            text = ""
-
+    text = await run_in_threadpool(_extract_text_from_bytes, payload, suffix)
     description = await _describe_document(llm, safe_name, text)
+
+    # Persist to the cloud (MongoDB): bytes to GridFS, text + metadata to the
+    # kb_documents collection. This is the source of truth — the same upload
+    # is now visible to this user from any device they sign in from.
+    await run_in_threadpool(
+        kb_store.save_document,
+        settings,
+        user_id=user["user_id"],
+        filename=safe_name,
+        content=payload,
+        text=text,
+        description=description,
+        source="upload",
+    )
 
     indexed = False
     chunk_count: int | None = None
@@ -206,26 +221,10 @@ async def upload_document(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reindex after upload failed: %s", exc)
 
-    rel = str(target.relative_to(settings.kb_dir))
-
-    # Sidecar metadata so the Client Database listing can show the description
-    # without re-running the LLM on every page load. Additive: it never alters
-    # the upload contract or the indexed file content.
-    _write_sidecar(
-        target,
-        {
-            "filename": safe_name,
-            "description": description,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            "size_bytes": len(payload),
-            "source": "upload",
-        },
-    )
-
     return KbUploadResponse(
         ok=True,
         filename=safe_name,
-        relative_path=rel,
+        relative_path=f"{user['user_id']}/{safe_name}",
         description=description,
         indexed=indexed,
         kb_chunks=chunk_count,
@@ -237,53 +236,25 @@ async def list_documents(
     settings: Settings = Depends(get_settings_dep),
     user: dict[str, str] = Depends(require_user),
 ) -> KbListResponse:
-    """List documents this user has uploaded to the KB."""
-    user_dir = settings.kb_dir / "client_uploads" / user["user_id"]
-    if not user_dir.exists():
-        return KbListResponse(documents=[])
+    """List documents this user has uploaded to the KB (from the cloud DB)."""
+    rows = await run_in_threadpool(kb_store.list_documents, settings, user["user_id"])
 
     documents: list[KbDocument] = []
-    for entry in sorted(user_dir.iterdir()):
-        if not entry.is_file() or entry.name.endswith(".meta.json"):
-            continue
-        meta_path = entry.with_suffix(entry.suffix + ".meta.json")
-        description = ""
-        uploaded_at = ""
-        size_bytes = 0
-        source = "upload"
-        project_name = ""
-        github_url = ""
-        topics: list[str] = []
-        try:
-            stat = entry.stat()
-            size_bytes = stat.st_size
-            uploaded_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        except OSError:
-            pass
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                description = str(meta.get("description", "")) or description
-                uploaded_at = str(meta.get("uploaded_at", "")) or uploaded_at
-                size_bytes = int(meta.get("size_bytes", size_bytes) or size_bytes)
-                source = str(meta.get("source", source))
-                project_name = str(meta.get("project_name", ""))
-                github_url = str(meta.get("github_url", ""))
-                raw_topics = meta.get("topics", [])
-                if isinstance(raw_topics, list):
-                    topics = [str(t) for t in raw_topics]
-            except (OSError, json.JSONDecodeError):
-                pass
+    for meta in rows:
+        raw_topics = meta.get("topics", [])
+        topics = [str(t) for t in raw_topics] if isinstance(raw_topics, list) else []
+        filename = str(meta.get("filename", ""))
         documents.append(
             KbDocument(
-                filename=entry.name,
-                relative_path=str(entry.relative_to(settings.kb_dir)),
-                description=description or "(No description available — re-upload to generate one.)",
-                size_bytes=size_bytes,
-                uploaded_at=uploaded_at,
-                source=source,
-                project_name=project_name,
-                github_url=github_url,
+                filename=filename,
+                relative_path=f"{user['user_id']}/{filename}",
+                description=str(meta.get("description", ""))
+                or "(No description available — re-upload to generate one.)",
+                size_bytes=int(meta.get("size_bytes", 0) or 0),
+                uploaded_at=str(meta.get("uploaded_at", "")),
+                source=str(meta.get("source", "upload")),
+                project_name=str(meta.get("project_name", "")),
+                github_url=str(meta.get("github_url", "")),
                 topics=topics,
             )
         )
@@ -322,14 +293,24 @@ async def add_github_project(
         "---\n\n"
     )
     body = header + (readme_text or "(No README found on GitHub.)")
-
-    user_dir = settings.kb_dir / "client_uploads" / user["user_id"]
-    user_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_filename(f"github_{owner}_{repo}.md")
-    target = user_dir / safe_name
-    target.write_text(body, encoding="utf-8")
 
     description = await _describe_document(llm, safe_name, body)
+
+    # Persist the imported project to the cloud (MongoDB) just like an upload.
+    await run_in_threadpool(
+        kb_store.save_document,
+        settings,
+        user_id=user["user_id"],
+        filename=safe_name,
+        content=body.encode("utf-8"),
+        text=body,
+        description=description,
+        source="github",
+        project_name=project_name,
+        github_url=github_url,
+        topics=topics,
+    )
 
     indexed = False
     chunk_count: int | None = None
@@ -340,25 +321,10 @@ async def add_github_project(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reindex after GitHub import failed: %s", exc)
 
-    _write_sidecar(
-        target,
-        {
-            "filename": safe_name,
-            "description": description,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            "size_bytes": len(body.encode("utf-8")),
-            "source": "github",
-            "project_name": project_name,
-            "github_url": github_url,
-            "topics": topics,
-        },
-    )
-
-    rel = str(target.relative_to(settings.kb_dir))
     return KbUploadResponse(
         ok=True,
         filename=safe_name,
-        relative_path=rel,
+        relative_path=f"{user['user_id']}/{safe_name}",
         description=description,
         indexed=indexed,
         kb_chunks=chunk_count,
@@ -372,42 +338,19 @@ async def delete_document(
     rag: RagService = Depends(get_rag),
     user: dict[str, str] = Depends(require_user),
 ) -> KbDeleteResponse:
-    """Remove a document (and its .meta.json sidecar) from this user's KB.
+    """Remove a document from this user's KB in the cloud (MongoDB).
 
-    The filename is constrained to a single path component under the
-    caller's own ``client_uploads/<user_id>/`` directory; the resolved
-    target must stay inside that directory or the request is rejected as
-    a path-traversal attempt. A reindex follows so the vector store stops
-    returning the deleted chunks.
+    The document is looked up by ``(user_id, filename)`` so a user can only
+    ever delete their own documents — there is no shared filesystem and no
+    path to traverse. A reindex follows so the vector store stops returning
+    the deleted chunks.
     """
     safe_name = _safe_filename(filename)
-    user_dir = (settings.kb_dir / "client_uploads" / user["user_id"]).resolve()
-    if not user_dir.exists():
+    deleted = await run_in_threadpool(
+        kb_store.delete_document, settings, user["user_id"], safe_name
+    )
+    if not deleted:
         raise NotFoundError("Document not found")
-
-    target = (user_dir / safe_name).resolve()
-    # Path-traversal guard: the resolved target must be a direct child of
-    # the user's own directory. Reject symlinks, ".." escapes, anything
-    # outside that scope.
-    try:
-        target.relative_to(user_dir)
-    except ValueError as exc:
-        raise AppError("Invalid filename", status_code=400) from exc
-    if target.parent != user_dir:
-        raise AppError("Invalid filename", status_code=400)
-    if not target.is_file():
-        raise NotFoundError("Document not found")
-
-    meta_path = target.with_suffix(target.suffix + ".meta.json")
-    try:
-        target.unlink()
-    except OSError as exc:
-        raise AppError(f"Could not delete file: {exc}", status_code=500) from exc
-    if meta_path.exists():
-        try:
-            meta_path.unlink()
-        except OSError as exc:
-            logger.warning("Could not delete sidecar %s: %s", meta_path, exc)
 
     indexed = False
     chunk_count: int | None = None

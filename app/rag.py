@@ -10,7 +10,6 @@ because the local (embedded) Qdrant client is not safe for concurrent use.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import xml.etree.ElementTree as ET
@@ -112,23 +111,6 @@ def extract_text(path: Path) -> str:
     return ""
 
 
-def _load_sidecar(path: Path) -> dict:
-    """Return the ``<file>.meta.json`` sidecar contents, or {} if absent/invalid.
-
-    Sidecars are written by the kb router on upload and on GitHub import. They
-    carry the AI-generated description, project name, and GitHub URL — much
-    higher topical signal than the raw README, so we mix them into the indexed
-    text.
-    """
-    meta_path = path.with_suffix(path.suffix + ".meta.json")
-    if not meta_path.exists():
-        return {}
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8")) or {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 class RagService:
     """Owns the embedding model and the Qdrant collection."""
 
@@ -172,60 +154,47 @@ class RagService:
         )
 
     def reindex(self) -> int:
-        """Rebuild the vector index from the Client Database only.
+        """Rebuild the vector index from the cloud (MongoDB) document store.
 
-        Indexing is intentionally scoped to ``<kb_dir>/client_uploads/`` —
-        the directory that holds every user's uploaded document and
-        GitHub-imported project. Any loose files at the root of
-        ``knowledge_base/`` (legacy PDFs, the README, ad-hoc drops) are
-        ignored on purpose so RAG retrieval reflects exactly what the user
-        sees in the Client Database UI and nothing else.
+        Every document a user has uploaded or imported lives in MongoDB (see
+        :mod:`app.kb_store`), carrying its already-extracted text and metadata.
+        We pull them all and rebuild the local Qdrant index from scratch, so a
+        fresh machine that has never seen the original files can still produce
+        a complete, up-to-date index purely from the cloud database. The local
+        Qdrant store is therefore just a derived cache.
+
+        Each document carries its owner ``user_id``; we stamp it on every chunk
+        so retrieval can filter to "only this user's projects" and one tenant's
+        portfolio never leaks into another's proposal.
         """
+        # Local import avoids a circular dependency (kb_store -> db -> config).
+        from . import kb_store
+
         with self._lock:
             self._ensure_stack()
-            kb_dir = self._settings.kb_dir
-            client_root = kb_dir / "client_uploads"
-            client_root.mkdir(parents=True, exist_ok=True)
 
             raw_chunks: list[dict[str, str]] = []
-            for path in sorted(client_root.rglob("*")):
-                if not path.is_file() or path.name.lower() == "readme.txt":
-                    continue
-                # Sidecar metadata files are read alongside their parent file;
-                # they must never be indexed as standalone documents.
-                if path.name.endswith(".meta.json"):
-                    continue
-
-                # Files live at <client_root>/<user_id>/<filename>. The first
-                # path component is the owner — stamp it on every chunk so
-                # retrieval can filter to "only this user's projects" and
-                # one tenant's portfolio never leaks into another's proposal.
-                rel_to_client = path.relative_to(client_root)
-                owner_id = rel_to_client.parts[0] if rel_to_client.parts else ""
+            for doc in kb_store.iter_all_documents(self._settings):
+                owner_id = str(doc.get("user_id") or "")
                 if not owner_id:
-                    # Stray file directly under client_uploads/ — skip rather
-                    # than index it as unowned and retrievable by everyone.
+                    # An unowned document would be retrievable by everyone —
+                    # skip rather than leak it across tenants.
                     continue
-
-                try:
-                    text = extract_text(path)
-                except Exception as exc:  # noqa: BLE001 - one bad file must not abort
-                    logger.warning("Failed to read %s: %s", path.name, exc)
-                    continue
+                text = str(doc.get("text") or "")
                 if not text.strip():
                     continue
+                filename = str(doc.get("filename") or "document")
 
-                # Mix in sidecar metadata: the AI-generated description is
+                # Mix in stored metadata: the AI-generated description is
                 # higher-signal than the raw README (it explicitly names the
                 # project type and domain), and prepending it makes topical
                 # queries hit the right project even when the README is
                 # verbose or off-topic. We also stash project_name /
                 # github_url / description on every chunk payload so they
                 # survive retrieval and reach the prompt.
-                meta = _load_sidecar(path)
-                project_name = str(meta.get("project_name") or "")
-                github_url = str(meta.get("github_url") or "")
-                description = str(meta.get("description") or "")
+                project_name = str(doc.get("project_name") or "")
+                github_url = str(doc.get("github_url") or "")
+                description = str(doc.get("description") or "")
                 header_lines: list[str] = []
                 if project_name:
                     header_lines.append(f"Project: {project_name}")
@@ -246,8 +215,8 @@ class RagService:
                 ):
                     raw_chunks.append(
                         {
-                            "source": str(path.relative_to(kb_dir)),
-                            "chunk_id": f"{path.name}:{i}",
+                            "source": f"{owner_id}/{filename}",
+                            "chunk_id": f"{filename}:{i}",
                             "content": part,
                             "project_name": project_name,
                             "github_url": github_url,
