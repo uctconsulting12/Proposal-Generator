@@ -12,11 +12,6 @@ RUN npm run build          # -> /frontend/dist
 # --- Stage 2: Python runtime ------------------------------------------------
 FROM python:3.12-slim AS runtime
 
-# onnxruntime (pulled in by fastembed) needs libgomp at runtime.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \

@@ -39,7 +39,9 @@ Verify: `curl https://YOURNAME.ngrok-free.app/api/tags` returns your model list 
 1. Push this repo to GitHub.
 2. Render → **New → Web Service** → connect the repo.
 3. **Runtime: Docker** (it auto-detects the `Dockerfile`).
-4. **Instance type: ≥ 1 GB RAM** (the embedding model OOMs on 512 MB).
+4. **Instance type: Free (512 MB) is fine.** Embeddings run remotely on your
+   Ollama host (not in this process), so there is no local embedding model to
+   blow the memory budget.
 5. Add the environment variables below.
 6. Create. Render builds the image (frontend + backend) and starts it.
 
@@ -50,10 +52,14 @@ Verify: `curl https://YOURNAME.ngrok-free.app/api/tags` returns your model list 
 | `COPILOT_LLM_PROVIDER` | `ollama` |
 | `COPILOT_OLLAMA_URL` | `https://YOURNAME.ngrok-free.app/api/chat` |
 | `COPILOT_MODEL_NAME` | `qwen3:14b` (or a smaller model for speed) |
+| `COPILOT_OLLAMA_EMBED_MODEL` | `nomic-embed-text` (must be pulled on the Ollama host) |
 | `COPILOT_MONGODB_URI` | your Atlas connection string |
 | `COPILOT_MONGODB_DB_NAME` | `jd_copilot_auth` |
 | `COPILOT_JWT_SECRET` | a real random secret (see below) |
 | `COPILOT_LLM_TIMEOUT_S` | `300` (local model over a tunnel is slow) |
+
+> RAG needs the embedding model on your Ollama host. Pull it once:
+> `ollama pull nomic-embed-text`
 
 `COPILOT_SERVE_FRONTEND=true` and `COPILOT_HOST=0.0.0.0` are already baked into
 the Dockerfile. Render injects `$PORT`; the container honors it.

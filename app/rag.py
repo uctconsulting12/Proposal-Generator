@@ -1,11 +1,17 @@
 """Retrieval-Augmented Generation service.
 
-Indexes the knowledge-base directory into a local Qdrant collection using
-fastembed embeddings, and retrieves the most relevant chunks for a query.
+Indexes the cloud (MongoDB) knowledge-base documents into a local Qdrant
+collection and retrieves the most relevant chunks for a query.
 
-All operations are blocking (embedding + vector I/O); callers in async contexts
-must dispatch them to a worker thread. A lock serialises index/query access
-because the local (embedded) Qdrant client is not safe for concurrent use.
+Embeddings are produced by a remote Ollama server (the same one used for chat,
+reached over its HTTP API) rather than a local model. That keeps the deployed
+process lightweight enough to run on a small (512 MB) instance: the heavy
+embedding model lives on the Ollama host, not in this process.
+
+All operations are blocking (HTTP embedding calls + vector I/O); callers in
+async contexts must dispatch them to a worker thread. A lock serialises
+index/query access because the local (embedded) Qdrant client is not safe for
+concurrent use.
 """
 
 from __future__ import annotations
@@ -16,13 +22,19 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
+import httpx
+
 from .config import Settings
 from .errors import DependencyUnavailableError
 
-# BGE bi-encoders are trained with this exact prefix on queries. Without it,
-# retrieval quality drops noticeably and disproportionately hurts topical
-# specificity (the failure mode the user reported).
-_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+# nomic-embed-text (the default Ollama embedding model) is trained with task
+# prefixes: queries use "search_query:" and stored passages use
+# "search_document:". Applying them noticeably improves retrieval quality.
+_NOMIC_QUERY_PREFIX = "search_query: "
+_NOMIC_DOC_PREFIX = "search_document: "
+
+# Embed in batches so a large knowledge base does not become one giant request.
+_EMBED_BATCH = 32
 
 # Overfetch factor: ask Qdrant for k * this many candidates so the per-source
 # diversification step has enough material to produce k distinct projects.
@@ -33,10 +45,9 @@ _MAX_CHUNKS_PER_SOURCE = 2
 
 logger = logging.getLogger(__name__)
 
-# Optional heavy dependencies — imported defensively so the module can be
-# imported (and unit-tested) even when they are absent.
+# Qdrant is the only heavy dependency now (embeddings are remote). Imported
+# defensively so the module can still be imported (and unit-tested) without it.
 try:  # pragma: no cover - import guard
-    from fastembed import TextEmbedding
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
         Distance,
@@ -49,7 +60,6 @@ try:  # pragma: no cover - import guard
 
     _VECTOR_STACK_AVAILABLE = True
 except ImportError:  # pragma: no cover - import guard
-    TextEmbedding = None
     QdrantClient = None
     Distance = PointStruct = VectorParams = None
     FieldCondition = Filter = MatchValue = None
@@ -112,12 +122,11 @@ def extract_text(path: Path) -> str:
 
 
 class RagService:
-    """Owns the embedding model and the Qdrant collection."""
+    """Owns the Qdrant collection; embeddings are produced remotely via Ollama."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._lock = threading.RLock()
-        self._embedder = None
         self._client = None
         self._chunk_count = 0
 
@@ -131,17 +140,41 @@ class RagService:
         return self._chunk_count
 
     def _ensure_stack(self) -> None:
-        """Lazily initialise the embedder and vector store. Caller holds lock."""
+        """Lazily initialise the vector store. Caller holds lock."""
         if not _VECTOR_STACK_AVAILABLE:
             raise DependencyUnavailableError(
-                "Vector dependencies missing. Install: pip install qdrant-client fastembed"
+                "Vector dependency missing. Install: pip install qdrant-client"
             )
-        if self._embedder is None:
-            logger.info("Loading embedding model %s", self._settings.embedding_model)
-            self._embedder = TextEmbedding(model_name=self._settings.embedding_model)
         if self._client is None:
             self._settings.qdrant_path.mkdir(parents=True, exist_ok=True)
             self._client = QdrantClient(path=str(self._settings.qdrant_path))
+
+    def _embed(self, texts: list[str], *, is_query: bool) -> list[list[float]]:
+        """Embed texts via the remote Ollama embedding endpoint.
+
+        Uses the same Ollama host as chat (derived from ``ollama_url``) so a
+        single tunnel serves both. Task prefixes are applied per nomic-embed's
+        convention. Batched to keep each HTTP request small.
+        """
+        prefix = _NOMIC_QUERY_PREFIX if is_query else _NOMIC_DOC_PREFIX
+        inputs = [prefix + t for t in texts]
+        base = self._settings.ollama_url.rsplit("/api/", 1)[0]
+        url = f"{base}/api/embed"
+        model = self._settings.ollama_embed_model
+
+        out: list[list[float]] = []
+        with httpx.Client(timeout=self._settings.llm_timeout_s) as client:
+            for start in range(0, len(inputs), _EMBED_BATCH):
+                batch = inputs[start : start + _EMBED_BATCH]
+                resp = client.post(url, json={"model": model, "input": batch})
+                resp.raise_for_status()
+                embeddings = resp.json().get("embeddings")
+                if not embeddings or len(embeddings) != len(batch):
+                    raise DependencyUnavailableError(
+                        "Ollama returned no embeddings; is the embed model pulled?"
+                    )
+                out.extend(embeddings)
+        return out
 
     def _recreate_collection(self, vector_size: int) -> None:
         name = self._settings.qdrant_collection
@@ -226,15 +259,16 @@ class RagService:
                     )
 
             if not raw_chunks:
-                self._recreate_collection(vector_size=384)
+                # 768 = nomic-embed-text dimension (placeholder for an empty KB).
+                self._recreate_collection(vector_size=768)
                 self._chunk_count = 0
                 logger.info("Knowledge base is empty; created empty collection")
                 return 0
 
-            vectors = list(self._embedder.embed([c["content"] for c in raw_chunks]))
+            vectors = self._embed([c["content"] for c in raw_chunks], is_query=False)
             self._recreate_collection(vector_size=len(vectors[0]))
             points = [
-                PointStruct(id=i + 1, vector=vec.tolist(), payload=chunk)
+                PointStruct(id=i + 1, vector=vec, payload=chunk)
                 for i, (vec, chunk) in enumerate(zip(vectors, raw_chunks))
             ]
             self._client.upsert(
@@ -255,9 +289,9 @@ class RagService:
 
         Three retrieval tweaks beyond a plain vector search:
 
-        * BGE bi-encoders need the canonical query prefix to score well, so we
-          prepend it before embedding (only on the query side — passages are
-          embedded as-is, which matches how the index was built).
+        * nomic-embed needs the ``search_query:`` task prefix on queries (and
+          ``search_document:`` on passages) to score well; ``_embed`` applies
+          the right prefix per call.
         * Qdrant is asked for ``top_k * _RETRIEVAL_OVERFETCH`` candidates; we
           then keep at most ``_MAX_CHUNKS_PER_SOURCE`` chunks per source file
           and return the first ``top_k`` results. This stops one verbose
@@ -273,7 +307,6 @@ class RagService:
         if not query:
             return []
         top_k = top_k or self._settings.retrieval_top_k
-        prefixed_query = _BGE_QUERY_PREFIX + query
         fetch_limit = max(top_k * _RETRIEVAL_OVERFETCH, top_k)
         query_filter = None
         if user_id:
@@ -286,7 +319,7 @@ class RagService:
             )
         with self._lock:
             self._ensure_stack()
-            query_vec = list(self._embedder.embed([prefixed_query]))[0].tolist()
+            query_vec = self._embed([query], is_query=True)[0]
             hits = self._client.query_points(
                 collection_name=self._settings.qdrant_collection,
                 query=query_vec,

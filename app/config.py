@@ -66,6 +66,9 @@ class Settings(BaseSettings):
 
     # Ollama-specific
     ollama_url: str = "http://localhost:11434/api/chat"
+    # Embedding model served by the same Ollama host (used for RAG). Running
+    # embeddings remotely keeps this process light enough for a 512 MB box.
+    ollama_embed_model: str = "nomic-embed-text"
 
     # Gemini-specific
     gemini_api_key: str = ""

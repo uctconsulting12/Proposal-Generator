@@ -12,6 +12,7 @@ python-multipart>=0.0.9
 fpdf2>=2.7
 
 # RAG stack (optional at runtime — the app degrades gracefully without it).
+# Embeddings are produced remotely by Ollama (see app/rag.py), so no local
+# embedding model / onnxruntime is needed — keeps the footprint small.
 qdrant-client>=1.10
-fastembed>=0.3
 pypdf>=4.0
